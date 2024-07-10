@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libc::c_char;
+use log::RecordBuilder;
 
 use crate::{panic, raw, util::Binding};
 
@@ -57,6 +58,43 @@ impl Binding for TraceLevel {
     }
 }
 
+impl TraceLevel {
+    /// Convert the [TraceLevel] to a [log::LevelFilter].
+    ///
+    /// [TraceLevel::Fatal] becomes [log::LevelFilter::Error] but otherwise all the conversions
+    /// are trivial.
+    pub const fn as_log_level_filter(self) -> log::LevelFilter {
+        use log::LevelFilter;
+
+        match self {
+            Self::None => LevelFilter::Off,
+            Self::Fatal | Self::Error => LevelFilter::Error,
+            Self::Warn => LevelFilter::Warn,
+            Self::Info => LevelFilter::Info,
+            Self::Debug => LevelFilter::Debug,
+            Self::Trace => LevelFilter::Trace,
+        }
+    }
+
+    /// Attempt to convert this [TraceLevel] to a [log::LevelFilter].
+    ///
+    /// This is done trivially with two exceptions:
+    /// - [TraceLevel::None] goes to [None]
+    /// - [TraceLevel::Fatal] goes to [log::Level::Error].
+    pub const fn as_log_level(self) -> Option<log::Level> {
+        use log::Level;
+
+        match self {
+            Self::None => None,
+            Self::Fatal | Self::Error => Some(Level::Error),
+            Self::Warn => Some(Level::Warn),
+            Self::Info => Some(Level::Info),
+            Self::Debug => Some(Level::Debug),
+            Self::Trace => Some(Level::Trace),
+        }
+    }
+}
+
 //TODO: pass raw &[u8] and leave conversion to consumer (breaking API)
 /// Callback type used to pass tracing events to the subscriber.
 /// see `trace_set` to register a subscriber.
@@ -64,7 +102,7 @@ pub type TracingCb = fn(TraceLevel, &str);
 
 static CALLBACK: AtomicUsize = AtomicUsize::new(0);
 
-///
+/// Set the tracing callback.
 pub fn trace_set(level: TraceLevel, cb: TracingCb) -> bool {
     CALLBACK.store(cb as usize, Ordering::SeqCst);
 
@@ -73,6 +111,27 @@ pub fn trace_set(level: TraceLevel, cb: TracingCb) -> bool {
     }
 
     return true;
+}
+
+/// Passes [trace_set] a shim function to pass tracing info to the [log] crate.
+pub fn trace_shim_log_crate() {
+    // Use `trace` to get all tracing events -- let the user configure filtering
+    // through the `log` crate.
+    trace_set(TraceLevel::Trace, |level, msg| {
+        // Convert the trace level to a log level.
+        let log_level = level
+        .as_log_level()
+        .expect("libgit2 should not produce tracing events with level=None");
+
+        // Build a record to pass to the logger.
+        let mut record_builder = RecordBuilder::new();
+
+        // Set the target and level.
+        record_builder.target("libgit2").level(log_level);
+
+        // Log the trace event to the global logger.
+        log::logger().log(&record_builder.args(format_args!("{}", msg)).build());
+    });
 }
 
 extern "C" fn tracing_cb_c(level: raw::git_trace_level_t, msg: *const c_char) {
